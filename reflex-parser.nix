@@ -1,4 +1,4 @@
-{ mkDerivation, base, reflex, stdenv }:
+{ mkDerivation, base, reflex, reflex-basic-host, stdenv, stm }:
 mkDerivation {
   pname = "reflex-parser";
   version = "0.1.0.0";
@@ -6,6 +6,6 @@ mkDerivation {
   isLibrary = true;
   isExecutable = true;
   libraryHaskellDepends = [ base reflex ];
-  executableHaskellDepends = [ base ];
+  executableHaskellDepends = [ base reflex reflex-basic-host stm ];
   license = stdenv.lib.licenses.bsd3;
 }
