@@ -1,108 +1,206 @@
 {-# language DeriveFunctor, StandaloneDeriving #-}
+{-# language LambdaCase #-}
+{-# language RankNTypes #-}
 {-# language RecordWildCards #-}
+{-# language RecursiveDo #-}
+{-# language ScopedTypeVariables #-}
 {-# language TupleSections #-}
 module Reflex.Parser where
 
 import Reflex
 import Control.Applicative (Alternative(..))
+import Control.Monad (join)
+import Control.Monad.Fix (MonadFix)
+import Data.Char (isDigit)
 import Data.Either (isLeft)
 import Data.List (uncons)
 import Data.Maybe (isNothing)
 
-data ParseError
-  = Unexpected Char
-  | UnexpectedEof
-  deriving Show
+data Result t a
+  = Parsed a (Dynamic t (Derivs t))
+  | ParseError
 
-data ParseOutput t a
-  = ParseOutput
-  { poResult :: Event t (String, a)
-  , poError :: Event t ParseError
+data Derivs t
+  = Derivs
+  { dvAdd :: Dynamic t (Result t Int)
+  , dvMult :: Dynamic t (Result t Int)
+  , dvPrimary :: Dynamic t (Result t Int)
+  , dvDecimal :: Dynamic t (Result t Int)
+  , dvSome :: forall a. (Derivs t -> Dynamic t (Result t a)) -> Dynamic t (Result t [a])
+  , dvMany :: forall a. (Derivs t -> Dynamic t (Result t a)) -> Dynamic t (Result t [a])
+  , dvSatisfy :: (Char -> Bool) -> Dynamic t (Result t Char)
   }
-deriving instance Reflex t => Functor (ParseOutput t)
 
--- | Parser t a ~ (Time -> String) -> [Time * String * a]
-newtype Parser t m a
-  = Parser
-  { unParser :: Event t String -> m (ParseOutput t a)
-  }
-deriving instance (Reflex t, Functor m) => Functor (Parser t m)
+pAdd :: Reflex t => Derivs t -> Dynamic t (Result t Int)
+pAdd d = do
+  r1 <- dvm
+  case r1 of
+    Parsed n d' -> do
+      dd' <- d'
+      r2 <- dvSatisfy dd' (=='+')
+      case r2 of
+        Parsed _ d'' -> do
+          dd'' <- d''
+          r3 <- dvAdd dd''
+          case r3 of
+            Parsed m d''' -> pure $ Parsed (n+m) d'''
+            ParseError -> pure ParseError
+        ParseError -> dvm
+    ParseError -> pure ParseError
+  where
+    dvm = dvMult d
 
-runParser
-  :: (Reflex t, Functor m)
-  => Parser t m a
-  -> Event t String
-  -> m (ParseOutput t a)
-runParser p eInput = unParser p eInput
+pMult :: Reflex t => Derivs t -> Dynamic t (Result t Int)
+pMult d = do
+  r1 <- dvm
+  case r1 of
+    Parsed n d' -> do
+      dd' <- d'
+      r2 <- dvSatisfy dd' (=='*')
+      case r2 of
+        Parsed _ d'' -> do
+          dd'' <- d''
+          r3 <- dvMult dd''
+          case r3 of
+            Parsed m d''' -> pure $ Parsed (n*m) d'''
+            ParseError -> pure ParseError
+        ParseError -> dvm
+    ParseError -> pure ParseError
+  where
+    dvm = dvPrimary d
 
-zero :: (Reflex t, Applicative m) => Parser t m a
-zero =
-  Parser $ \eInput ->
-  pure $ ParseOutput { poResult = never, poError = never }
+pPrimary :: Reflex t => Derivs t -> Dynamic t (Result t Int)
+pPrimary d = do
+  r1 <- dvSatisfy d (=='(')
+  case r1 of
+    Parsed n d' -> do
+      dd' <- d'
+      r2 <- dvAdd dd'
+      case r2 of
+        Parsed n d'' -> do
+          dd'' <- d''
+          r3 <- dvSatisfy dd'' (==')')
+          case r3 of
+            Parsed _ d''' -> pure $ Parsed n d'''
+            ParseError -> pure ParseError
+        ParseError -> pure ParseError
+    ParseError -> dvDecimal d
 
-choice
-  :: (Reflex t, Applicative m)
-  => Parser t m a
-  -> Parser t m a
-  -> Parser t m a
-choice (Parser pa) (Parser pb) =
-  Parser $ \eInput ->
-    (\eOutput1 eOutput2 ->
-       ParseOutput
-       { poResult = leftmost [poResult eOutput1, poResult eOutput2]
-       , poError = leftmost [poError eOutput1, poError eOutput2]
-       }) <$>
-    pa eInput <*>
-    pb eInput
+pMany :: Reflex t => Derivs t -> (Derivs t -> Dynamic t (Result t a)) -> Dynamic t (Result t [a])
+pMany d r = do
+  r1 <- dvs
+  case r1 of
+    Parsed as d' -> dvs
+    ParseError -> pure $ Parsed [] (pure d)
+  where
+    dvs = dvSome d r
 
-unit :: (Reflex t, Applicative m) => Parser t m ()
-unit =
-  Parser $ \eInput ->
-  pure $ ParseOutput { poResult = (, ()) <$> eInput, poError = never }
+pSome :: Reflex t => Derivs t -> (Derivs t -> Dynamic t (Result t a)) -> Dynamic t (Result t [a])
+pSome d r = do
+  r1 <- r d
+  case r1 of
+    Parsed a d' -> do
+      dd' <- d'
+      r2 <- dvMany dd' r
+      case r2 of
+        Parsed as d'' -> pure $ Parsed (a:as) d''
+        ParseError -> pure ParseError
+    ParseError -> pure ParseError
 
-tensor
-  :: (Reflex t, MonadHold t m)
-  => Parser t m a
-  -> Parser t m b
-  -> Parser t m (a, b)
-tensor (Parser pa) (Parser pb) =
-  Parser $ \eInput -> do
-    eOutput1 <- pa eInput
-    eOutput2 <- pb $ fst <$> poResult eOutput1
-    poError <-
-      switchHoldPromptly (poError eOutput1) $
-      poError eOutput2 <$ poResult eOutput1
-    poResult <-
-      switchHoldPromptly never $
-      (\a -> (\(str, b) -> (str, (a, b))) <$> poResult eOutput2) . snd <$>
-      poResult eOutput1
-    pure ParseOutput{..}
+pDecimal :: Reflex t => Derivs t -> Dynamic t (Result t Int)
+pDecimal d = do
+  r1 <- dvSome d (flip dvSatisfy isDigit)
+  case r1 of
+    Parsed as d' -> pure $ Parsed (read as) d'
+    ParseError -> pure ParseError
 
-instance (Reflex t, MonadHold t m) => Applicative (Parser t m) where
-  pure a = a <$ unit
-  a <*> b = (\(f, x) -> f x) <$> tensor a b
+data Replace
+  = Replace
+  { patchValue :: String
+  , patchStart :: Int
+  , patchSpan :: Int
+  } deriving (Show, Read)
 
-instance (Reflex t, MonadHold t m) => Alternative (Parser t m) where
-  empty = zero
-  (<|>) = choice
+unitReplace :: Replace
+unitReplace = Replace "" 0 0
 
-satisfy :: (Reflex t, Applicative m) => (Char -> Bool) -> Parser t m Char
-satisfy p =
-  Parser $ \eInput ->
-  let
-    (poError, poResult) =
-      fanEither $
-      fmap
-        (\str ->
-           case uncons str of
-             Nothing -> Left UnexpectedEof
-             Just (x, xs) ->
-               if p x
-               then Right (xs, x)
-               else Left $ Unexpected x)
-        eInput
-  in
-    pure $ ParseOutput{..}
+runReplace :: Replace -> String -> String
+runReplace (Replace s start span) = go s start span
+  where
+    go s start span s' =
+      if start <= 0
+      then
+        if span <= 0
+        then s <> s'
+        else case s' of
+          [] -> s
+          x:xs -> go s start (span-1) xs
+      else case s' of
+        [] -> s
+        x:xs -> x : go s (start-1) span xs
 
-char :: (Reflex t, Applicative m) => Char -> Parser t m Char
-char c = satisfy (==c)
+data DString t
+  = Empty
+  | Cons Char (Dynamic t (DString t))
+
+fromString :: Reflex t => String -> DString t
+fromString [] = Empty
+fromString (x:xs) = Cons x . pure $ fromString xs
+
+fromStringApp :: Reflex t => String -> DString t -> DString t
+fromStringApp s ds = go s
+  where
+    go [] = ds
+    go (x:xs) = Cons x . pure $ go xs
+
+runReplaceD :: Reflex t => Replace -> Dynamic t (DString t) -> Dynamic t (DString t)
+runReplaceD (Replace s start span) = go s start span
+  where
+    go :: Reflex t => String -> Int -> Int -> Dynamic t (DString t) -> Dynamic t (DString t)
+    go s start span s' =
+      if start <= 0
+      then
+        if span <= 0
+        then fromStringApp s <$> s'
+        else s' >>= \case
+          Empty -> pure $ fromString s
+          Cons x xs -> go s start (span-1) xs
+      else
+        (\case
+            Empty -> fromString s
+            Cons x xs -> Cons x $ go s (start-1) span xs) <$>
+        s'
+
+makeDString :: (Reflex t, MonadHold t m, MonadFix m) => Event t Replace -> m (Dynamic t (DString t))
+makeDString eReplace = join <$> foldDyn runReplaceD (pure Empty) eReplace
+
+toString :: Reflex t => DString t -> Dynamic t String
+toString Empty = pure []
+toString (Cons c cs) = (c :) <$> (cs >>= toString)
+
+parse :: forall t m. Reflex t => Dynamic t (DString t) -> Derivs t
+parse dString = d
+  where
+    d = Derivs{..}
+
+    dvAdd = pAdd d
+    dvMult = pMult d
+    dvPrimary = pPrimary d
+
+    dvMany :: forall a. (Derivs t -> Dynamic t (Result t a)) -> Dynamic t (Result t [a])
+    dvMany = pMany d
+
+    dvSome :: forall a. (Derivs t -> Dynamic t (Result t a)) -> Dynamic t (Result t [a])
+    dvSome = pSome d
+
+    dvDecimal = pDecimal d
+
+    dvSatisfy p = go <$> dString
+      where
+        go :: DString t -> Result t Char
+        go (Cons c cs) | p c = Parsed c . pure $ parse cs
+        go _ = ParseError
+
+fromResult :: Result t a -> Maybe a
+fromResult (Parsed a _) = Just a
+fromResult ParseError = Nothing

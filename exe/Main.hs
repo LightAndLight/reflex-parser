@@ -7,33 +7,34 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
+import Text.Read (readMaybe)
 
 import Reflex.Parser
-
-data Boo = Bar | Bop deriving Show
-
-boo :: (Reflex t, MonadHold t m) => Parser t m Boo
-boo =
-  char 'b' *>
-  (Bar <$ char 'a' <* char 'r' <|>
-   Bop <$ char 'o' <* char 'p')
 
 main :: IO ()
 main =
   basicHostForever $ do
-    var <- liftIO $ newTVarIO ""
+    var <- liftIO $ newTVarIO unitReplace
 
     (eInput, triggerInput) <- newTriggerEvent
-    eInput' <- performEvent $ liftIO (readTVarIO var) <$ eInput
+    eReplace <- performEvent $ liftIO (readTVarIO var) <$ eInput
 
-    eOutput <- runParser boo eInput'
-    performEvent $ liftIO . print <$> poResult eOutput
-    performEvent $ liftIO . print <$> poError eOutput
+    dString <- makeDString eReplace
+
+    let dOutput = dvAdd $ parse dString
+    performEvent $ liftIO . print <$> updated (dString >>= toString)
+    performEvent $ liftIO . print <$> eReplace
+    performEvent $ liftIO . print . fromResult <$> updated dOutput
 
     void . liftIO . forkIO $ loop var triggerInput
   where
     loop var f = do
       line <- getLine
-      () <- atomically $ writeTVar var line
-      () <- f ()
-      loop var f
+      a <- fmap readMaybe getLine :: IO (Maybe Int)
+      b <- fmap readMaybe getLine :: IO (Maybe Int)
+      case Replace line <$> a <*> b of
+        Nothing -> loop var f
+        Just r -> do
+          () <- atomically $ writeTVar var r
+          () <- f ()
+          loop var f
